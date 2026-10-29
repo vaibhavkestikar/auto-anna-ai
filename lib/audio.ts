@@ -1,6 +1,13 @@
 const TARGET_RATE = 16_000;
 
 let shared: AudioContext | null = null;
+let micStream: MediaStream | null = null;
+
+export type CaptureSession = {
+  stop: () => Promise<Blob | null>;
+  reused: boolean;
+  startedAt: number;
+};
 
 export function unlockAudio() {
   if (!shared || shared.state === "closed") {
@@ -12,8 +19,15 @@ export function unlockAudio() {
   return shared;
 }
 
-export function startCapture(onTick: (seconds: number) => void) {
+export function releaseMic() {
+  micStream?.getTracks().forEach((track) => track.stop());
+  micStream = null;
+}
+
+export function startCapture(onTick: (seconds: number) => void): Promise<CaptureSession> {
   const ctx = unlockAudio();
+  const existing = liveMic();
+  if (existing) return Promise.resolve(beginRecording(existing, ctx, onTick, true));
   if (!navigator.mediaDevices?.getUserMedia) {
     return Promise.reject(new Error("This browser has no microphone. Open Auto Anna on your phone."));
   }
@@ -39,26 +53,20 @@ export function startCapture(onTick: (seconds: number) => void) {
   });
 
   return guarded.then((stream) => {
-      const started = performance.now();
-      const timer = window.setInterval(() => {
-        onTick(Math.min(15, Math.floor((performance.now() - started) / 1000)));
-      }, 200);
-
-      if (typeof MediaRecorder !== "undefined") {
-        try {
-          return recordWithMediaRecorder(stream, ctx, started, timer);
-        } catch {
-          // Older browsers fall through to the processor path.
-        }
-      }
-      return recordWithProcessor(stream, ctx, started, timer);
-    },
-  );
+    micStream = stream;
+    return beginRecording(stream, ctx, onTick, false);
+  });
 }
 
 export async function playMp3Base64(base64: string) {
   const ctx = unlockAudio();
-  await ctx.resume();
+  if (ctx.state !== "running") {
+    try {
+      await withTimeout(ctx.resume(), 800, "speaker");
+    } catch {
+      // The hold already resumed playback. Keep going.
+    }
+  }
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
@@ -76,12 +84,44 @@ export async function playMp3Base64(base64: string) {
   });
 }
 
+function liveMic() {
+  if (!micStream) return null;
+  const live = micStream.getAudioTracks().some((track) => track.readyState === "live");
+  if (!live) {
+    micStream = null;
+    return null;
+  }
+  return micStream;
+}
+
+function beginRecording(
+  stream: MediaStream,
+  ctx: AudioContext,
+  onTick: (seconds: number) => void,
+  reused: boolean,
+): CaptureSession {
+  const started = performance.now();
+  const timer = window.setInterval(() => {
+    onTick(Math.min(15, Math.floor((performance.now() - started) / 1000)));
+  }, 200);
+
+  if (typeof MediaRecorder !== "undefined") {
+    try {
+      return recordWithMediaRecorder(stream, ctx, started, timer, reused);
+    } catch {
+      // Older browsers fall through to the processor path.
+    }
+  }
+  return recordWithProcessor(stream, ctx, started, timer, reused);
+}
+
 function recordWithMediaRecorder(
   stream: MediaStream,
   ctx: AudioContext,
   started: number,
   timer: number,
-) {
+  reused: boolean,
+): CaptureSession {
   const recorder = createRecorder(stream);
   const parts: Blob[] = [];
   recorder.addEventListener("dataavailable", (event) => {
@@ -96,20 +136,33 @@ function recordWithMediaRecorder(
   }
 
   return {
-    stop: async () => {
-      window.clearInterval(timer);
-      const elapsed = performance.now() - started;
-      await stopRecorder(recorder);
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-      stream.getTracks().forEach((track) => track.stop());
-      if (elapsed < 450 || parts.length === 0) return null;
-      const blob = new Blob(parts, { type: recorder.mimeType || "audio/mp4" });
-      return (await blobToWav(blob, ctx)) ?? blob;
-    },
+    reused,
+    startedAt: started,
+    stop: () =>
+      withTimeout(
+        (async () => {
+          window.clearInterval(timer);
+          const elapsed = performance.now() - started;
+          await stopRecorder(recorder);
+          await new Promise((resolve) => window.setTimeout(resolve, 80));
+          if (elapsed < 450 || parts.length === 0) return null;
+          const blob = new Blob(parts, { type: recorder.mimeType || "audio/mp4" });
+          if (sendRaw(blob)) return blob;
+          return (await blobToWav(blob, ctx)) ?? blob;
+        })(),
+        4000,
+        "The recording did not send. Hold the button again.",
+      ),
   };
 }
 
-function recordWithProcessor(stream: MediaStream, ctx: AudioContext, started: number, timer: number) {
+function recordWithProcessor(
+  stream: MediaStream,
+  ctx: AudioContext,
+  started: number,
+  timer: number,
+  reused: boolean,
+): CaptureSession {
   const source = ctx.createMediaStreamSource(stream);
   const processor = ctx.createScriptProcessor(4096, 1, 1);
   const sink = ctx.createMediaStreamDestination();
@@ -121,6 +174,8 @@ function recordWithProcessor(stream: MediaStream, ctx: AudioContext, started: nu
   processor.connect(sink);
 
   return {
+    reused,
+    startedAt: started,
     stop: async () => {
       window.clearInterval(timer);
       const elapsed = performance.now() - started;
@@ -128,7 +183,6 @@ function recordWithProcessor(stream: MediaStream, ctx: AudioContext, started: nu
       source.disconnect();
       processor.disconnect();
       sink.disconnect();
-      stream.getTracks().forEach((track) => track.stop());
       if (elapsed < 450 || chunks.length === 0) return null;
       const down = downsample(merge(chunks), ctx.sampleRate, TARGET_RATE);
       return encodeWav(down, TARGET_RATE);
@@ -141,6 +195,7 @@ function createRecorder(stream: MediaStream) {
   const types = ios
     ? ["audio/mp4", "audio/aac", "audio/webm"]
     : ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+  const take = new MediaStream(stream.getAudioTracks());
   const mimeType = types.find((type) => {
     try {
       return MediaRecorder.isTypeSupported(type);
@@ -148,7 +203,7 @@ function createRecorder(stream: MediaStream) {
       return false;
     }
   });
-  return mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+  return mimeType ? new MediaRecorder(take, { mimeType }) : new MediaRecorder(take);
 }
 
 async function stopRecorder(recorder: MediaRecorder) {
@@ -164,12 +219,32 @@ async function stopRecorder(recorder: MediaRecorder) {
   });
 }
 
+function isAppleTouch() {
+  return (
+    /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  );
+}
+
+function sendRaw(blob: Blob) {
+  if (isAppleTouch()) return true;
+  const type = blob.type.toLowerCase();
+  return (
+    type.includes("mp4") ||
+    type.includes("aac") ||
+    type.includes("mpeg") ||
+    type.includes("wav") ||
+    type.includes("ogg") ||
+    type.includes("flac")
+  );
+}
+
 async function blobToWav(blob: Blob, ctx: AudioContext) {
-  await ctx.resume();
+  void ctx.resume();
   const raw = await blob.arrayBuffer();
   let decoded: AudioBuffer;
   try {
-    decoded = await ctx.decodeAudioData(raw.slice(0));
+    decoded = await withTimeout(ctx.decodeAudioData(raw.slice(0)), 2000, "decode");
   } catch {
     return null;
   }

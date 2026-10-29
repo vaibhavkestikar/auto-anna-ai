@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { playMp3Base64, startCapture, unlockAudio } from "@/lib/audio";
+import { playMp3Base64, releaseMic, startCapture, unlockAudio, type CaptureSession } from "@/lib/audio";
 import { MODE_COPY, type Mode, type Side } from "@/lib/modes";
 import { BEATS } from "@/lib/script";
 
@@ -17,8 +17,6 @@ type Card = {
   mode?: Mode;
 };
 
-type Capture = { stop: () => Promise<Blob | null> };
-
 export function AutoStage() {
   const [mode, setMode] = useState<Mode>("street");
   const [phase, setPhase] = useState<Phase>("idle");
@@ -28,9 +26,10 @@ export function AutoStage() {
   const [error, setError] = useState<string | null>(null);
   const [bro, setBro] = useState(false);
   const [status, setStatus] = useState("");
+  const [needsTap, setNeedsTap] = useState(false);
 
   const modeRef = useRef(mode);
-  const session = useRef<Capture | null>(null);
+  const session = useRef<CaptureSession | null>(null);
   const released = useRef(false);
   const sideRef = useRef<Side>("you");
   const busy = useRef(false);
@@ -39,17 +38,25 @@ export function AutoStage() {
   const pressedAt = useRef(0);
   const releaseRef = useRef<() => void>(() => {});
   const disarm = useRef<(() => void) | null>(null);
+  const phaseRef = useRef(phase);
+  const needsTapRef = useRef(false);
+  const gestureBroken = useRef(false);
+  phaseRef.current = phase;
 
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
 
   useEffect(() => {
+    const stopMic = () => releaseMic();
+    window.addEventListener("pagehide", stopMic);
     return () => {
       released.current = true;
       disarm.current?.();
       if (capTimer.current) window.clearTimeout(capTimer.current);
       void session.current?.stop();
+      window.removeEventListener("pagehide", stopMic);
+      releaseMic();
     };
   }, []);
 
@@ -61,15 +68,20 @@ export function AutoStage() {
     if (session.current) void finish();
   }
 
+  function markTapToSend() {
+    gestureBroken.current = true;
+    needsTapRef.current = true;
+    setNeedsTap(true);
+    setStatus("Tap the button to send that line.");
+  }
+
   function armRelease() {
     disarm.current?.();
     const stop = (event: Event) => {
-      const touchPointerCancelled =
-        event.type === "pointercancel" &&
-        "pointerType" in event &&
-        (event as globalThis.PointerEvent).pointerType === "touch";
-      const micJustOpened = event.type === "touchcancel" && performance.now() - pressedAt.current < 800;
-      if (touchPointerCancelled || micJustOpened) return;
+      if (touchCancelled(event)) {
+        markTapToSend();
+        return;
+      }
       releaseRef.current();
     };
     window.addEventListener("pointerup", stop, true);
@@ -89,13 +101,17 @@ export function AutoStage() {
 
   async function begin(side: Side) {
     const now = performance.now();
-    if ((session.current || phase === "recording") && now - pressedAt.current > 400) {
+    const recording = session.current || phaseRef.current === "recording";
+    if (recording && (needsTapRef.current || now - pressedAt.current > 400)) {
       release();
       return;
     }
-    if (busy.current || phase !== "idle") return;
+    if (busy.current || phaseRef.current !== "idle") return;
     pressedAt.current = now;
     released.current = false;
+    gestureBroken.current = false;
+    needsTapRef.current = false;
+    setNeedsTap(false);
     unlockAudio();
     armRelease();
     busy.current = true;
@@ -105,14 +121,35 @@ export function AutoStage() {
     setBro(false);
     setActiveSide(side);
     setSeconds(0);
+    phaseRef.current = "recording";
     setPhase("recording");
     setStatus("Meter's running. Release to send.");
     try {
       const cap = await startCapture(setSeconds);
-      session.current = cap;
+      const permissionGesture = !cap.reused && performance.now() - cap.startedAt < 700;
+      if (permissionGesture && (gestureBroken.current || released.current)) {
+        await cap.stop();
+        disarm.current?.();
+        busy.current = false;
+        gestureBroken.current = false;
+        needsTapRef.current = false;
+        setNeedsTap(false);
+        phaseRef.current = "idle";
+        setPhase("idle");
+        setActiveSide(null);
+        setStatus("Mic is ready. Hold again and speak.");
+        return;
+      }
       if (released.current) {
+        session.current = cap;
         void finish();
         return;
+      }
+      session.current = cap;
+      if (gestureBroken.current) {
+        needsTapRef.current = true;
+        setNeedsTap(true);
+        setStatus("Tap the button to send that line.");
       }
       capTimer.current = window.setTimeout(() => {
         void finish();
@@ -120,6 +157,7 @@ export function AutoStage() {
     } catch (err) {
       disarm.current?.();
       busy.current = false;
+      phaseRef.current = "idle";
       setPhase("idle");
       setActiveSide(null);
       setStatus("");
@@ -139,11 +177,17 @@ export function AutoStage() {
     const side = sideRef.current;
     const selected = modeRef.current;
     const ticket = generation.current;
+    needsTapRef.current = false;
+    setNeedsTap(false);
+    phaseRef.current = "working";
+    setPhase("working");
+    setStatus(workingLine(side, selected));
     let blob: Blob | null = null;
     try {
       blob = await cap.stop();
     } catch (err) {
       busy.current = false;
+      phaseRef.current = "idle";
       setPhase("idle");
       setActiveSide(null);
       setStatus("");
@@ -152,6 +196,7 @@ export function AutoStage() {
     }
     if (!blob) {
       busy.current = false;
+      phaseRef.current = "idle";
       setPhase("idle");
       setActiveSide(null);
       setStatus("");
@@ -159,8 +204,6 @@ export function AutoStage() {
       return;
     }
 
-    setPhase("working");
-    setStatus(workingLine(side, selected));
     try {
       const body = new FormData();
       body.append("audio", blob, audioFileName(blob));
@@ -339,6 +382,7 @@ export function AutoStage() {
           tone="you"
           recording={phase === "recording" && activeSide === "you"}
           seconds={seconds}
+          needsTap={needsTap}
           disabled={locked || (phase === "recording" && activeSide !== "you")}
           onPress={() => void begin("you")}
           onRelease={release}
@@ -350,6 +394,7 @@ export function AutoStage() {
           tone="anna"
           recording={phase === "recording" && activeSide === "anna"}
           seconds={seconds}
+          needsTap={needsTap}
           disabled={locked || (phase === "recording" && activeSide !== "anna")}
           onPress={() => void begin("anna")}
           onRelease={release}
@@ -409,6 +454,7 @@ function HoldButton({
   tone,
   recording,
   seconds,
+  needsTap,
   disabled,
   onPress,
   onRelease,
@@ -419,6 +465,7 @@ function HoldButton({
   tone: "you" | "anna";
   recording: boolean;
   seconds: number;
+  needsTap: boolean;
   disabled: boolean;
   onPress: () => void;
   onRelease: () => void;
@@ -451,16 +498,19 @@ function HoldButton({
       ref={buttonRef}
       type="button"
       disabled={disabled}
-      aria-label={recording ? `Recording ${language}. Release to send.` : `Hold to speak ${language}`}
+      aria-label={
+        recording
+          ? needsTap
+            ? `Recording ${language}. Tap to send.`
+            : `Recording ${language}. Release to send.`
+          : `Hold to speak ${language}`
+      }
       onPointerDown={(event) => {
         if (event.pointerType === "touch") return;
         event.preventDefault();
         pressRef.current();
       }}
-      onPointerUp={(event) => {
-        if (event.pointerType === "touch") return;
-        releaseRef.current();
-      }}
+      onPointerUp={() => releaseRef.current()}
       onContextMenu={(event) => event.preventDefault()}
       className={`talk-btn touch-none flex min-h-28 select-none flex-col items-start justify-between rounded-3xl px-4 py-3 text-left disabled:opacity-40 ${
         recording ? "rec-pulse" : ""
@@ -476,9 +526,20 @@ function HoldButton({
       </span>
       <span className="text-2xl font-black leading-none">{language}</span>
       <span className="text-xs font-bold opacity-70">
-        {recording ? `Release · 0:${String(seconds).padStart(2, "0")}` : hint}
+        {recording
+          ? `${needsTap ? "Tap to send" : "Release"} · 0:${String(seconds).padStart(2, "0")}`
+          : hint}
       </span>
     </button>
+  );
+}
+
+function touchCancelled(event: Event) {
+  if (event.type === "touchcancel") return true;
+  return (
+    event.type === "pointercancel" &&
+    "pointerType" in event &&
+    (event as globalThis.PointerEvent).pointerType === "touch"
   );
 }
 
