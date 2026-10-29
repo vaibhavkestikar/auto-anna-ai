@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type PointerEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 import { playMp3Base64, startCapture, unlockAudio } from "@/lib/audio";
 import { MODE_COPY, type Mode, type Side } from "@/lib/modes";
 import { BEATS } from "@/lib/script";
@@ -36,6 +36,9 @@ export function AutoStage() {
   const busy = useRef(false);
   const capTimer = useRef<number | null>(null);
   const generation = useRef(0);
+  const pressedAt = useRef(0);
+  const releaseRef = useRef<() => void>(() => {});
+  const disarm = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     modeRef.current = mode;
@@ -43,6 +46,8 @@ export function AutoStage() {
 
   useEffect(() => {
     return () => {
+      released.current = true;
+      disarm.current?.();
       if (capTimer.current) window.clearTimeout(capTimer.current);
       void session.current?.stop();
     };
@@ -51,17 +56,49 @@ export function AutoStage() {
   const blurb = MODE_COPY.find((item) => item.id === mode)?.blurb ?? "";
   const locked = phase === "working" || phase === "playing";
 
-  async function begin(side: Side, event: PointerEvent<HTMLButtonElement>) {
-    event.preventDefault();
-    if (busy.current || phase !== "idle") return;
-    try {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    } catch {
-      // Pointer capture is a convenience. pointerup still ends the take.
+  function release() {
+    released.current = true;
+    if (session.current) void finish();
+  }
+
+  function armRelease() {
+    disarm.current?.();
+    const stop = (event: Event) => {
+      const touchPointerCancelled =
+        event.type === "pointercancel" &&
+        "pointerType" in event &&
+        (event as globalThis.PointerEvent).pointerType === "touch";
+      const micJustOpened = event.type === "touchcancel" && performance.now() - pressedAt.current < 800;
+      if (touchPointerCancelled || micJustOpened) return;
+      releaseRef.current();
+    };
+    window.addEventListener("pointerup", stop, true);
+    window.addEventListener("pointercancel", stop, true);
+    window.addEventListener("touchend", stop, true);
+    window.addEventListener("touchcancel", stop, true);
+    disarm.current = () => {
+      window.removeEventListener("pointerup", stop, true);
+      window.removeEventListener("pointercancel", stop, true);
+      window.removeEventListener("touchend", stop, true);
+      window.removeEventListener("touchcancel", stop, true);
+      disarm.current = null;
+    };
+  }
+
+  releaseRef.current = release;
+
+  async function begin(side: Side) {
+    const now = performance.now();
+    if ((session.current || phase === "recording") && now - pressedAt.current > 400) {
+      release();
+      return;
     }
-    unlockAudio();
-    busy.current = true;
+    if (busy.current || phase !== "idle") return;
+    pressedAt.current = now;
     released.current = false;
+    unlockAudio();
+    armRelease();
+    busy.current = true;
     sideRef.current = side;
     generation.current += 1;
     setError(null);
@@ -69,22 +106,19 @@ export function AutoStage() {
     setActiveSide(side);
     setSeconds(0);
     setPhase("recording");
-    setStatus("Meter's running...");
+    setStatus("Meter's running. Release to send.");
     try {
       const cap = await startCapture(setSeconds);
+      session.current = cap;
       if (released.current) {
-        await cap.stop();
-        busy.current = false;
-        setPhase("idle");
-        setActiveSide(null);
-        setStatus("");
+        void finish();
         return;
       }
-      session.current = cap;
       capTimer.current = window.setTimeout(() => {
         void finish();
       }, 15_000);
     } catch (err) {
+      disarm.current?.();
       busy.current = false;
       setPhase("idle");
       setActiveSide(null);
@@ -93,16 +127,11 @@ export function AutoStage() {
     }
   }
 
-  function end(event: PointerEvent<HTMLButtonElement>) {
-    event.preventDefault();
-    released.current = true;
-    if (session.current) void finish();
-  }
-
   async function finish() {
     const cap = session.current;
     if (!cap) return;
     session.current = null;
+    disarm.current?.();
     if (capTimer.current) {
       window.clearTimeout(capTimer.current);
       capTimer.current = null;
@@ -113,8 +142,13 @@ export function AutoStage() {
     let blob: Blob | null = null;
     try {
       blob = await cap.stop();
-    } catch {
-      blob = null;
+    } catch (err) {
+      busy.current = false;
+      setPhase("idle");
+      setActiveSide(null);
+      setStatus("");
+      setError(err instanceof Error ? err.message : "The recording broke. Try again.");
+      return;
     }
     if (!blob) {
       busy.current = false;
@@ -129,7 +163,7 @@ export function AutoStage() {
     setStatus(workingLine(side, selected));
     try {
       const body = new FormData();
-      body.append("audio", blob, "turn.wav");
+      body.append("audio", blob, audioFileName(blob));
       body.append("direction", side);
       body.append("mode", selected);
       const response = await fetch("/api/turn", { method: "POST", body });
@@ -306,9 +340,8 @@ export function AutoStage() {
           recording={phase === "recording" && activeSide === "you"}
           seconds={seconds}
           disabled={locked || (phase === "recording" && activeSide !== "you")}
-          onPointerDown={(event) => void begin("you", event)}
-          onPointerUp={end}
-          onPointerCancel={end}
+          onPress={() => void begin("you")}
+          onRelease={release}
         />
         <HoldButton
           title="Anna"
@@ -318,9 +351,8 @@ export function AutoStage() {
           recording={phase === "recording" && activeSide === "anna"}
           seconds={seconds}
           disabled={locked || (phase === "recording" && activeSide !== "anna")}
-          onPointerDown={(event) => void begin("anna", event)}
-          onPointerUp={end}
-          onPointerCancel={end}
+          onPress={() => void begin("anna")}
+          onRelease={release}
         />
       </div>
 
@@ -378,9 +410,8 @@ function HoldButton({
   recording,
   seconds,
   disabled,
-  onPointerDown,
-  onPointerUp,
-  onPointerCancel,
+  onPress,
+  onRelease,
 }: {
   title: string;
   language: string;
@@ -389,21 +420,49 @@ function HoldButton({
   recording: boolean;
   seconds: number;
   disabled: boolean;
-  onPointerDown: (event: PointerEvent<HTMLButtonElement>) => void;
-  onPointerUp: (event: PointerEvent<HTMLButtonElement>) => void;
-  onPointerCancel: (event: PointerEvent<HTMLButtonElement>) => void;
+  onPress: () => void;
+  onRelease: () => void;
 }) {
   const you = tone === "you";
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const pressRef = useRef(onPress);
+  const releaseRef = useRef(onRelease);
+  pressRef.current = onPress;
+  releaseRef.current = onRelease;
+
+  useEffect(() => {
+    const node = buttonRef.current;
+    if (!node) return;
+    const start = (event: TouchEvent) => {
+      if (event.cancelable) event.preventDefault();
+      pressRef.current();
+    };
+    const end = () => releaseRef.current();
+    node.addEventListener("touchstart", start, { passive: false });
+    node.addEventListener("touchend", end);
+    return () => {
+      node.removeEventListener("touchstart", start);
+      node.removeEventListener("touchend", end);
+    };
+  }, []);
+
   return (
     <button
+      ref={buttonRef}
       type="button"
       disabled={disabled}
-      aria-label={recording ? `Recording ${language}` : `Hold to speak ${language}`}
-      onPointerDown={onPointerDown}
-      onPointerUp={onPointerUp}
-      onPointerCancel={onPointerCancel}
+      aria-label={recording ? `Recording ${language}. Release to send.` : `Hold to speak ${language}`}
+      onPointerDown={(event) => {
+        if (event.pointerType === "touch") return;
+        event.preventDefault();
+        pressRef.current();
+      }}
+      onPointerUp={(event) => {
+        if (event.pointerType === "touch") return;
+        releaseRef.current();
+      }}
       onContextMenu={(event) => event.preventDefault()}
-      className={`touch-none flex min-h-28 select-none flex-col items-start justify-between rounded-3xl px-4 py-3 text-left disabled:opacity-40 ${
+      className={`talk-btn touch-none flex min-h-28 select-none flex-col items-start justify-between rounded-3xl px-4 py-3 text-left disabled:opacity-40 ${
         recording ? "rec-pulse" : ""
       } ${
         you
@@ -417,10 +476,20 @@ function HoldButton({
       </span>
       <span className="text-2xl font-black leading-none">{language}</span>
       <span className="text-xs font-bold opacity-70">
-        {recording ? `0:${String(seconds).padStart(2, "0")}` : hint}
+        {recording ? `Release · 0:${String(seconds).padStart(2, "0")}` : hint}
       </span>
     </button>
   );
+}
+
+function audioFileName(blob: Blob) {
+  const type = blob.type.toLowerCase();
+  if (type.includes("mp4") || type.includes("m4a")) return "turn.m4a";
+  if (type.includes("aac")) return "turn.aac";
+  if (type.includes("ogg")) return "turn.ogg";
+  if (type.includes("mpeg") || type.includes("mp3")) return "turn.mp3";
+  if (type.includes("webm")) return "turn.webm";
+  return "turn.wav";
 }
 
 function workingLine(side: Side, mode: Mode) {

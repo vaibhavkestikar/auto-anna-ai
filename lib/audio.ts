@@ -12,47 +12,48 @@ export function unlockAudio() {
   return shared;
 }
 
-export async function startCapture(onTick: (seconds: number) => void) {
+export function startCapture(onTick: (seconds: number) => void) {
   const ctx = unlockAudio();
-  await ctx.resume();
   if (!navigator.mediaDevices?.getUserMedia) {
-    throw new Error("This browser has no microphone. Open Auto Anna on your phone.");
+    return Promise.reject(new Error("This browser has no microphone. Open Auto Anna on your phone."));
   }
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-  });
-  const source = ctx.createMediaStreamSource(stream);
-  const processor = ctx.createScriptProcessor(4096, 1, 1);
-  const sink = ctx.createGain();
-  sink.gain.value = 0;
-  const chunks: Float32Array[] = [];
-  processor.onaudioprocess = (event) => {
-    chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
-  };
-  source.connect(processor);
-  processor.connect(sink);
-  sink.connect(ctx.destination);
 
-  const started = performance.now();
-  const timer = window.setInterval(() => {
-    onTick(Math.min(15, Math.floor((performance.now() - started) / 1000)));
-  }, 200);
-
-  return {
-    stop: async () => {
-      window.clearInterval(timer);
-      const elapsed = performance.now() - started;
-      processor.onaudioprocess = null;
-      source.disconnect();
-      processor.disconnect();
-      sink.disconnect();
-      stream.getTracks().forEach((track) => track.stop());
-      if (elapsed < 450 || chunks.length === 0) return null;
-      const merged = merge(chunks);
-      const down = downsample(merged, ctx.sampleRate, TARGET_RATE);
-      return encodeWav(down, TARGET_RATE);
+  // iOS Chrome drops the mic request if anything is awaited before this call.
+  const streamPromise = navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
     },
-  };
+  });
+  const guarded = withTimeout(
+    streamPromise,
+    8000,
+    "The microphone did not start. Hold the button again.",
+  ).catch((error: unknown) => {
+    void streamPromise.then(
+      (stream) => stream.getTracks().forEach((track) => track.stop()),
+      () => undefined,
+    );
+    throw error;
+  });
+
+  return guarded.then((stream) => {
+      const started = performance.now();
+      const timer = window.setInterval(() => {
+        onTick(Math.min(15, Math.floor((performance.now() - started) / 1000)));
+      }, 200);
+
+      if (typeof MediaRecorder !== "undefined") {
+        try {
+          return recordWithMediaRecorder(stream, ctx, started, timer);
+        } catch {
+          // Older browsers fall through to the processor path.
+        }
+      }
+      return recordWithProcessor(stream, ctx, started, timer);
+    },
+  );
 }
 
 export async function playMp3Base64(base64: string) {
@@ -72,6 +73,134 @@ export async function playMp3Base64(base64: string) {
     } catch (error) {
       reject(error instanceof Error ? error : new Error("The speaker coughed. Try that line again."));
     }
+  });
+}
+
+function recordWithMediaRecorder(
+  stream: MediaStream,
+  ctx: AudioContext,
+  started: number,
+  timer: number,
+) {
+  const recorder = createRecorder(stream);
+  const parts: Blob[] = [];
+  recorder.addEventListener("dataavailable", (event) => {
+    if (event.data.size > 0) parts.push(event.data);
+  });
+  const ios = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  try {
+    if (ios) recorder.start();
+    else recorder.start(250);
+  } catch {
+    recorder.start();
+  }
+
+  return {
+    stop: async () => {
+      window.clearInterval(timer);
+      const elapsed = performance.now() - started;
+      await stopRecorder(recorder);
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+      stream.getTracks().forEach((track) => track.stop());
+      if (elapsed < 450 || parts.length === 0) return null;
+      const blob = new Blob(parts, { type: recorder.mimeType || "audio/mp4" });
+      return (await blobToWav(blob, ctx)) ?? blob;
+    },
+  };
+}
+
+function recordWithProcessor(stream: MediaStream, ctx: AudioContext, started: number, timer: number) {
+  const source = ctx.createMediaStreamSource(stream);
+  const processor = ctx.createScriptProcessor(4096, 1, 1);
+  const sink = ctx.createMediaStreamDestination();
+  const chunks: Float32Array[] = [];
+  processor.onaudioprocess = (event) => {
+    chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+  };
+  source.connect(processor);
+  processor.connect(sink);
+
+  return {
+    stop: async () => {
+      window.clearInterval(timer);
+      const elapsed = performance.now() - started;
+      processor.onaudioprocess = null;
+      source.disconnect();
+      processor.disconnect();
+      sink.disconnect();
+      stream.getTracks().forEach((track) => track.stop());
+      if (elapsed < 450 || chunks.length === 0) return null;
+      const down = downsample(merge(chunks), ctx.sampleRate, TARGET_RATE);
+      return encodeWav(down, TARGET_RATE);
+    },
+  };
+}
+
+function createRecorder(stream: MediaStream) {
+  const ios = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const types = ios
+    ? ["audio/mp4", "audio/aac", "audio/webm"]
+    : ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+  const mimeType = types.find((type) => {
+    try {
+      return MediaRecorder.isTypeSupported(type);
+    } catch {
+      return false;
+    }
+  });
+  return mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+}
+
+async function stopRecorder(recorder: MediaRecorder) {
+  if (recorder.state === "inactive") return;
+  await new Promise<void>((resolve) => {
+    recorder.addEventListener("stop", () => resolve(), { once: true });
+    window.setTimeout(resolve, 1500);
+    try {
+      recorder.stop();
+    } catch {
+      resolve();
+    }
+  });
+}
+
+async function blobToWav(blob: Blob, ctx: AudioContext) {
+  await ctx.resume();
+  const raw = await blob.arrayBuffer();
+  let decoded: AudioBuffer;
+  try {
+    decoded = await ctx.decodeAudioData(raw.slice(0));
+  } catch {
+    return null;
+  }
+  const down = downsample(mixToMono(decoded), decoded.sampleRate, TARGET_RATE);
+  if (down.length < TARGET_RATE * 0.4) return null;
+  return encodeWav(down, TARGET_RATE);
+}
+
+function mixToMono(buffer: AudioBuffer) {
+  if (buffer.numberOfChannels === 1) return buffer.getChannelData(0);
+  const mixed = new Float32Array(buffer.length);
+  for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+    const data = buffer.getChannelData(channel);
+    for (let i = 0; i < buffer.length; i += 1) mixed[i] += data[i] / buffer.numberOfChannels;
+  }
+  return mixed;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string) {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        window.clearTimeout(timer);
+        reject(error);
+      },
+    );
   });
 }
 

@@ -85,9 +85,23 @@ function sarvamMessage(status: number, data: Json) {
   return "Sarvam dropped the call. Try that line again.";
 }
 
+function speechFileName(audio: Blob) {
+  if (typeof File !== "undefined" && audio instanceof File && audio.name && audio.name !== "blob") {
+    return audio.name;
+  }
+  const type = audio.type.toLowerCase();
+  if (type.includes("mp4") || type.includes("m4a")) return "turn.m4a";
+  if (type.includes("aac")) return "turn.aac";
+  if (type.includes("ogg")) return "turn.ogg";
+  if (type.includes("mpeg") || type.includes("mp3")) return "turn.mp3";
+  if (type.includes("webm")) return "turn.webm";
+  if (type.includes("flac")) return "turn.flac";
+  return "turn.wav";
+}
+
 export async function transcribe(audio: Blob, language: LanguageCode) {
   const form = new FormData();
-  form.append("file", audio, "turn.wav");
+  form.append("file", audio, speechFileName(audio));
   form.append("model", "saaras:v4");
   form.append("mode", "transcribe");
   form.append("language_code", language);

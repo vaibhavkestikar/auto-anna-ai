@@ -43,6 +43,13 @@ body {
   }
 }
 
+.talk-btn {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: none;
+}
+
 .rec-pulse {
   animation: pulse-rec 0.7s ease-in-out infinite;
 }
