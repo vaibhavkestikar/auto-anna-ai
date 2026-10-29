@@ -1,26 +1,59 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #0e0d0b;
+  --foreground: #f6f1e3;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --font-sans: var(--font-display), var(--font-deva), var(--font-knda), sans-serif;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-display), var(--font-deva), var(--font-knda), sans-serif;
+}
+
+::selection {
+  background: #ffc107;
+  color: #14120e;
+}
+
+@keyframes pulse-rec {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.035);
+  }
+}
+
+@keyframes slam {
+  0% {
+    transform: scale(1.35);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.rec-pulse {
+  animation: pulse-rec 0.7s ease-in-out infinite;
+}
+
+.slam {
+  animation: slam 0.22s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rec-pulse,
+  .slam {
+    animation: none;
+  }
 }
