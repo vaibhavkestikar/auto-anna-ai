@@ -124,6 +124,7 @@ function recordWithMediaRecorder(
 ): CaptureSession {
   const recorder = createRecorder(stream);
   const parts: Blob[] = [];
+  const pcm = tapPcm(stream, ctx);
   recorder.addEventListener("dataavailable", (event) => {
     if (event.data.size > 0) parts.push(event.data);
   });
@@ -143,14 +144,19 @@ function recordWithMediaRecorder(
         (async () => {
           window.clearInterval(timer);
           const elapsed = performance.now() - started;
+          pcm.stop();
           await stopRecorder(recorder);
           await new Promise((resolve) => window.setTimeout(resolve, 80));
-          if (elapsed < 450 || parts.length === 0) return null;
-          const blob = new Blob(parts, { type: recorder.mimeType || "audio/mp4" });
-          if (sendRaw(blob)) return blob;
-          return (await blobToWav(blob, ctx)) ?? blob;
+          if (elapsed < 450) return null;
+          const wav = wavFromPcm(pcm.chunks, ctx.sampleRate);
+          if (wav) return wav;
+          if (parts.length === 0) return null;
+          const blob = new Blob(parts, { type: baseMime(recorder.mimeType) });
+          const decoded = await blobToWav(blob, ctx);
+          if (decoded) return decoded;
+          throw new Error("The phone recorded that, but it wasn't wav. Hold the button and say the line again.");
         })(),
-        4000,
+        6000,
         "The recording did not send. Hold the button again.",
       ),
   };
@@ -163,15 +169,8 @@ function recordWithProcessor(
   timer: number,
   reused: boolean,
 ): CaptureSession {
-  const source = ctx.createMediaStreamSource(stream);
-  const processor = ctx.createScriptProcessor(4096, 1, 1);
-  const sink = ctx.createMediaStreamDestination();
-  const chunks: Float32Array[] = [];
-  processor.onaudioprocess = (event) => {
-    chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
-  };
-  source.connect(processor);
-  processor.connect(sink);
+  const pcm = tapPcm(stream, ctx);
+  const chunks = pcm.chunks;
 
   return {
     reused,
@@ -179,10 +178,7 @@ function recordWithProcessor(
     stop: async () => {
       window.clearInterval(timer);
       const elapsed = performance.now() - started;
-      processor.onaudioprocess = null;
-      source.disconnect();
-      processor.disconnect();
-      sink.disconnect();
+      pcm.stop();
       if (elapsed < 450 || chunks.length === 0) return null;
       const down = downsample(merge(chunks), ctx.sampleRate, TARGET_RATE);
       return encodeWav(down, TARGET_RATE);
@@ -219,24 +215,62 @@ async function stopRecorder(recorder: MediaRecorder) {
   });
 }
 
-function isAppleTouch() {
-  return (
-    /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
-    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
-  );
+function tapPcm(stream: MediaStream, ctx: AudioContext) {
+  void ctx.resume();
+  const source = ctx.createMediaStreamSource(stream);
+  const processor = ctx.createScriptProcessor(4096, 1, 1);
+  const mute = ctx.createGain();
+  mute.gain.value = 0.00001;
+  const chunks: Float32Array[] = [];
+  processor.onaudioprocess = (event) => {
+    const buffer = event.inputBuffer;
+    if (buffer.numberOfChannels === 0 || buffer.length === 0) return;
+    const mono = new Float32Array(buffer.length);
+    const channels = buffer.numberOfChannels || 1;
+    for (let channel = 0; channel < channels; channel += 1) {
+      const data = buffer.getChannelData(channel);
+      for (let i = 0; i < buffer.length; i += 1) mono[i] += data[i] / channels;
+    }
+    chunks.push(mono);
+  };
+  source.connect(processor);
+  processor.connect(mute);
+  mute.connect(ctx.destination);
+  return {
+    chunks,
+    stop() {
+      processor.onaudioprocess = null;
+      try {
+        source.disconnect();
+        processor.disconnect();
+        mute.disconnect();
+      } catch {
+        // The graph is already torn down.
+      }
+    },
+  };
 }
 
-function sendRaw(blob: Blob) {
-  if (isAppleTouch()) return true;
-  const type = blob.type.toLowerCase();
-  return (
-    type.includes("mp4") ||
-    type.includes("aac") ||
-    type.includes("mpeg") ||
-    type.includes("wav") ||
-    type.includes("ogg") ||
-    type.includes("flac")
-  );
+function wavFromPcm(chunks: Float32Array[], sampleRate: number) {
+  if (chunks.length === 0) return null;
+  const merged = merge(chunks);
+  if (merged.length < sampleRate * 0.4 || !hasEnergy(merged)) return null;
+  return encodeWav(downsample(merged, sampleRate, TARGET_RATE), TARGET_RATE);
+}
+
+function hasEnergy(samples: Float32Array) {
+  let total = 0;
+  let count = 0;
+  for (let i = 0; i < samples.length; i += 16) {
+    total += samples[i] * samples[i];
+    count += 1;
+  }
+  return count > 0 && total / count > 0.0000004;
+}
+
+function baseMime(mime: string) {
+  const cut = mime.split(";")[0]?.trim();
+  return cut || "audio/mp4";
 }
 
 async function blobToWav(blob: Blob, ctx: AudioContext) {
