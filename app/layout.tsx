@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from "next";
+import { Analytics } from "@vercel/analytics/next";
 import { Bricolage_Grotesque, Noto_Sans_Devanagari, Noto_Sans_Kannada } from "next/font/google";
 import "./globals.css";
 
@@ -42,7 +43,10 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       lang="en"
       className={`${display.variable} ${devanagari.variable} ${kannada.variable} h-full`}
     >
-      <body className="min-h-dvh bg-[#0e0d0b] antialiased">{children}</body>
+      <body className="min-h-dvh bg-[#0e0d0b] antialiased">
+        {children}
+        <Analytics />
+      </body>
     </html>
   );
 }

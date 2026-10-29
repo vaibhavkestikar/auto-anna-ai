@@ -102,6 +102,8 @@ npm run lint
 3. Set `SARVAM_API_KEY` in the Vercel project's environment variables. Use the same name as `.env.example`.
 4. Deploy with `npx vercel --prod`, or let the Git integration deploy.
 
+Web Analytics is included with `@vercel/analytics`. After this deploy, open the project in Vercel, go to Analytics, and enable it if the tab asks you to. Page views show up there once the production site is visited. Local `npm run dev` does not send visits to the dashboard.
+
 `/api/turn` and `/api/speak` set `maxDuration = 60` because a live turn can call Sarvam three times. A public URL spends the credits on that key. Anyone who can open the site can trigger a translation. Watch usage in the Sarvam dashboard, and rotate the key if the link spreads farther than you meant.
 
 ## Project layout
